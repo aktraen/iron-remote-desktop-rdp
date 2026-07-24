@@ -5,8 +5,8 @@
   "contributors": [
     "Benoit Cortier"
   ],
-  "description": "RDP backend for iron-remote-desktop \u2014 aktraen fork with INFO_AUTOLOGON derived from credentials (autologon patch)",
-  "version": "0.7.0-aktraen.1",
+  "description": "RDP backend for iron-remote-desktop \u2014 aktraen fork: autologon + color_depth 32 (RLE fix) + microtask-deferred cursor callback (RefCell drag-panic fix)",
+  "version": "0.7.0-aktraen.2",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Devolutions/IronRDP.git"
