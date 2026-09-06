@@ -6,6 +6,24 @@ export declare const Backend: {
     DeviceEvent: typeof DeviceEvent;
 };
 
+/**
+ * In-memory Blob storage backend.
+ *
+ * Downloads are buffered as {@link Uint8Array} chunks in a plain array and
+ * assembled into a single {@link Blob} when the transfer completes.  This
+ * is the universal fallback that works in every browser context.
+ *
+ * **Trade-offs:**
+ * - Peak RAM ~2x file size (chunk array + final Blob).
+ * - No persistent storage; data is lost on page unload.
+ * - No setup cost; works even in non-secure contexts and private browsing.
+ */
+export declare class BlobStorageBackend implements FileStorageBackend {
+    readonly name = "blob";
+    createWriteHandle(_fileName: string, _expectedSize: number): Promise<FileWriteHandle>;
+    dispose(): Promise<void>;
+}
+
 declare class ClipboardData {
     free(): void;
     [Symbol.dispose](): void;
@@ -31,6 +49,26 @@ declare class DesktopSize {
     height: number;
     width: number;
 }
+
+/**
+ * Detect the best available storage backend for the current browser
+ * context.
+ *
+ * When `preference` is `'auto'` (default), the function probes for OPFS
+ * support with a full round-trip smoke test.  If OPFS is available, an
+ * {@link OpfsStorageBackend} is returned; otherwise a
+ * {@link BlobStorageBackend} is used as the universal fallback.
+ *
+ * When `preference` is `'blob'`, OPFS detection is skipped entirely and
+ * the Blob backend is returned immediately.
+ *
+ * @param preference - `'auto'` to detect, `'blob'` to force in-memory.
+ * @param sessionId  - Optional session identifier used as the OPFS
+ *                    subdirectory name.  When omitted a unique ID is
+ *                    generated from the current timestamp.
+ * @returns The selected backend, ready to use.
+ */
+export declare function detectStorageBackend(preference?: StorageBackendPreference, sessionId?: string): Promise<FileStorageBackend>;
 
 declare class DeviceEvent {
     private constructor();
@@ -104,6 +142,11 @@ declare type EventMap = {
      *  listeners can register all transfers eagerly before progress events arrive. */
     'upload-batch-started': [Map<number, number>, DroppedFile[]];
     'files-available': [FileInfo[]];
+    /** Remote's response to one of our outbound Format Lists: `true` = accepted
+     *  (CB_RESPONSE_OK), `false` = rejected (CB_RESPONSE_FAIL). Fires for every
+     *  outbound advertise, so consumers can drive paste from it (e.g. inject the
+     *  paste keystroke on accept, retry on reject). */
+    'format-list-response': [boolean];
     error: [FileTransferError];
 };
 
@@ -243,6 +286,45 @@ export declare interface FileInfo {
 export declare function filesAvailableCallback(cb: (files: FileInfo[], clipDataId?: number) => void): Extension;
 
 /**
+ * Pluggable storage backend for file transfer downloads.
+ *
+ * The backend determines *where* incoming file chunks are buffered during
+ * a download.  Protocol-specific file transfer providers delegate all
+ * storage concerns to the active backend, keeping download orchestration
+ * logic storage-agnostic.
+ *
+ * Three backends are planned:
+ *
+ * | Backend | Buffering          | Peak RAM      | Browser support           |
+ * |---------|--------------------|---------------|---------------------------|
+ * | Blob    | In-memory array    | ~2x file size | Universal                 |
+ * | OPFS    | Origin Private FS  | ~chunk size   | Baseline (September 2025) |
+ * | FSAPI   | User-chosen file   | ~chunk size   | Chromium-only (future)    |
+ */
+export declare interface FileStorageBackend {
+    /** Human-readable backend name, used in log messages. */
+    readonly name: string;
+    /**
+     * Create a write handle for a new download.
+     *
+     * @param fileName   - Sanitized file basename (used for the temp file
+     *                     name in persistent backends).
+     * @param expectedSize - Expected total size in bytes.  Backends may use
+     *                     this for pre-allocation or quota checks.  A value
+     *                     of 0 means the size is unknown or the file is
+     *                     empty.
+     */
+    createWriteHandle(fileName: string, expectedSize: number): Promise<FileWriteHandle>;
+    /**
+     * Release all backend resources.
+     *
+     * For persistent backends this deletes the session directory and any
+     * temp files.  Safe to call multiple times.
+     */
+    dispose(): Promise<void>;
+}
+
+/**
  * Error information for file transfer operations.
  */
 export declare interface FileTransferError {
@@ -260,6 +342,48 @@ export declare interface FileTransferError {
     cause?: unknown;
 }
 
+/**
+ * A write handle for streaming file data to a storage backend.
+ *
+ * Created once per download via {@link FileStorageBackend.createWriteHandle}.
+ * Chunks are appended via {@link write}, and on success {@link finalize}
+ * returns the assembled data as a {@link Blob} (or {@link File}, which
+ * extends Blob).  On failure or cancellation, {@link abort} releases all
+ * resources held by the handle.
+ *
+ * Implementations may buffer in memory (Blob backend), stream to the
+ * Origin Private File System (OPFS backend), or stream to a user-chosen
+ * location (future FSAPI backend).
+ */
+export declare interface FileWriteHandle {
+    /** Append a chunk of data.
+     *
+     *  Backends may buffer the chunk in memory or flush it to persistent
+     *  storage immediately.  The returned promise resolves once the chunk
+     *  has been accepted (not necessarily persisted). */
+    write(chunk: Uint8Array): Promise<void>;
+    /**
+     * Finalize the file and return the result as a Blob.
+     *
+     * For in-memory backends this assembles a Blob from buffered chunks.
+     * For persistent backends (e.g. OPFS) this closes the writable stream
+     * and returns a {@link File} (which extends Blob) backed by the on-disk
+     * data, keeping peak RAM close to zero.
+     *
+     * After calling finalize the handle must not be reused.
+     */
+    finalize(): Promise<Blob>;
+    /**
+     * Discard all written data and release resources.
+     *
+     * Safe to call multiple times.  After abort the handle must not be
+     * reused.
+     */
+    abort(): Promise<void>;
+    /** Number of bytes successfully written so far. */
+    readonly bytesWritten: number;
+}
+
 export declare function init(log_level: string): Promise<void>;
 
 export declare function initiateFileCopy(files: FileInfo[]): Extension;
@@ -273,9 +397,82 @@ declare class InputTransaction {
 
 export declare function kdcProxyUrl(url: string): Extension;
 
+export declare function legacyGraphics(enable: boolean): Extension;
+
 export declare function lockCallback(cb: (dataId: number) => void): Extension;
 
 export declare function locksExpiredCallback(cb: (clipDataIds: Uint32Array) => void): Extension;
+
+/**
+ * Storage backend that streams download chunks to the Origin Private File
+ * System (OPFS).
+ *
+ * OPFS is a browser-provided, origin-scoped file system that requires no
+ * user permission prompts and is available on the main thread (async
+ * only).  This backend requires the {@link FileSystemWritableFileStream}
+ * API, which reached Baseline across all major browsers in September 2025
+ * (Chrome 86+, Firefox 111+, Safari 17.2+, Edge 86+).  Older browsers
+ * are detected automatically via {@link OpfsStorageBackend.probe} and
+ * fall back to the Blob backend.
+ *
+ * **How it works:**
+ * 1. On construction, a per-session subdirectory is created under
+ *    `ironrdp-transfers/` in the OPFS root.
+ * 2. Each download opens a {@link FileSystemWritableFileStream} inside
+ *    that directory and flushes chunks to disk as they arrive.
+ * 3. On completion, the stream is closed and a lazy {@link File} handle is
+ *    returned.  The File extends Blob, so existing consumers that expect
+ *    a Blob work without changes.
+ * 4. On dispose, the entire session directory is deleted.
+ *
+ * **Trade-offs vs Blob backend:**
+ * - Peak RAM drops from ~2x file size to ~chunk size (typically 64 KB).
+ * - Moderate write latency per chunk (async disk I/O), but the download
+ *   is already async and network-bound.
+ * - Storage is subject to the origin's quota (typically 60% of disk).
+ * - May be unavailable in some private browsing modes.
+ *
+ * **Construction:** Use the static {@link OpfsStorageBackend.create}
+ * factory method.  The constructor is private because initialization
+ * requires async OPFS directory setup.
+ */
+export declare class OpfsStorageBackend implements FileStorageBackend {
+    private readonly opfsRoot;
+    private sessionDir;
+    private readonly sessionId;
+    readonly name = "opfs";
+    /** Sequence counter for generating unique temp file names. */
+    private sequence;
+    private constructor();
+    /**
+     * Create an OPFS backend, including the per-session directory.
+     *
+     * Call {@link probe} first to verify OPFS is available before
+     * constructing -- this factory assumes OPFS works.
+     */
+    static create(opfsRoot: FileSystemDirectoryHandle, sessionId?: string): Promise<OpfsStorageBackend>;
+    /** Maximum age (in milliseconds) before a session directory is considered stale. */
+    private static readonly STALE_SESSION_THRESHOLD_MS;
+    /**
+     * Remove session directories older than {@link STALE_SESSION_THRESHOLD_MS}.
+     *
+     * Session IDs generated by {@link create} embed a timestamp in the
+     * format `s-{Date.now()}-{random}`.  This method parses that timestamp
+     * to determine age.  Directories with unparsable names or those
+     * belonging to the current session are skipped.
+     */
+    private static cleanupStale;
+    /**
+     * Probe whether OPFS is usable in the current context.
+     *
+     * Performs a full round-trip: creates a temp file, opens a writable,
+     * closes it, and deletes it.  This catches environments where the API
+     * exists but throws at runtime (e.g., some private browsing modes).
+     */
+    static probe(opfsRoot: FileSystemDirectoryHandle): Promise<boolean>;
+    createWriteHandle(fileName: string, _expectedSize: number): Promise<FileWriteHandle>;
+    dispose(): Promise<void>;
+}
 
 export declare function outboundMessageSizeLimit(limit: number): Extension;
 
@@ -384,6 +581,26 @@ export declare class RdpFileTransferProvider {
     private static readonly MAX_FILE_SIZE;
     /** Timeout for FileReader operations (60 seconds) to prevent stalled uploads */
     private static readonly FILE_READER_TIMEOUT_MS;
+    /**
+     * How long to keep clipboard monitoring suppressed after advertising an upload
+     * while waiting for the remote to pull the files (first FileContentsRequest),
+     * before giving up. Matches the Rust cliprdr lock inactivity timeout (60s), so
+     * the JS side gives up exactly when the protocol lock does. If the remote never
+     * requests contents (the paste landed in a non-file target, or the advertise was
+     * clobbered), the watchdog resumes monitoring and fails the upload so its state
+     * cannot wedge later uploads.
+     */
+    private static readonly PASTE_ACK_TIMEOUT_MS;
+    /**
+     * Upload inactivity window. After the remote starts pulling, each FileContentsRequest
+     * resets this; if pulls then stop for this long -- e.g. the remote grabbed the
+     * clipboard with a text/image copy that never reaches handleFilesAvailable -- the
+     * upload is failed so `uploadState` is released and later uploads aren't wedged. A
+     * slow-but-progressing transfer keeps resetting it, so it is never killed.
+     */
+    private static readonly UPLOAD_INACTIVITY_TIMEOUT_MS;
+    /** Timeout for storage backend write handle initialization (30 seconds). */
+    private static readonly WRITE_HANDLE_INIT_TIMEOUT_MS;
     /** Maximum recursion depth when traversing dropped directories. */
     private static readonly MAX_DIRECTORY_DEPTH;
     /** Maximum total entries (files + directories) collected from a single drop. */
@@ -392,9 +609,15 @@ export declare class RdpFileTransferProvider {
     private readonly chunkSize;
     private readonly onUploadStarted?;
     private readonly onUploadFinished?;
+    private readonly storagePreference;
     private readonly eventHandlers;
+    private storageBackend?;
+    private storageBackendReady?;
     private activeDownloads;
     private uploadState?;
+    private pasteAckTimeout?;
+    private uploadInactivityTimeout?;
+    private uploadMonitoringSuppressed;
     private retainedFiles?;
     private availableFiles;
     private clipDataId?;
@@ -407,6 +630,15 @@ export declare class RdpFileTransferProvider {
      */
     setSession(session: ExtensionSession): void;
     private ensureSession;
+    /**
+     * Lazily initialize and return the storage backend.
+     *
+     * Detection is performed once and cached.  Concurrent callers share
+     * the same initialization promise so the probe only runs once.
+     * If detection fails the cached promise is cleared so subsequent
+     * downloads can retry.
+     */
+    private ensureStorageBackend;
     private sendRequestFileContents;
     private sendSubmitFileContents;
     private sendInitiateFileCopy;
@@ -522,6 +754,63 @@ export declare class RdpFileTransferProvider {
      * ```
      */
     uploadFiles(files: File[] | DroppedFile[]): UploadHandle;
+    /** Whether an upload batch is currently advertised or in flight (a fresh upload, or a re-paste
+     *  rebuilt from retained files). */
+    isUploadInProgress(): boolean;
+    /** Suppress clipboard monitoring for an upload's paste window. Idempotent: a supersede keeps
+     *  monitoring suppressed across the old->new upload, so this must not re-fire `onUploadStarted`. */
+    private suppressUploadMonitoring;
+    /** Resume clipboard monitoring (idempotent: fires onUploadFinished at most once
+     *  per upload, since the resume point is now deferred past the wire send). */
+    private resumeUploadMonitoring;
+    /** Arm the paste-acknowledgment watchdog for the current upload. */
+    private armPasteAckWatchdog;
+    /** Disarm the paste-acknowledgment watchdog, if armed. */
+    private clearPasteAckWatchdog;
+    /**
+     * (Re)arm the upload inactivity watchdog (see {@link UPLOAD_INACTIVITY_TIMEOUT_MS}).
+     * Called on every FileContentsRequest, so continued pulls keep resetting it and a
+     * slow-but-progressing transfer is never killed; if pulls stop for the window the
+     * upload is failed (releasing uploadState). Skipped for re-pastes, matching the
+     * paste-ack watchdog.
+     */
+    private resetUploadInactivityWatchdog;
+    /** Disarm the upload inactivity watchdog, if armed. */
+    private clearUploadInactivityWatchdog;
+    /**
+     * The remote acknowledged the paste by requesting file contents: the clobber
+     * window is over, so disarm the paste-ack watchdog and resume clipboard monitoring.
+     * Called on every FileContentsRequest; only the first disarms/resumes. Every request
+     * also (re)arms the inactivity watchdog so a stall after pulling began is recovered.
+     */
+    private acknowledgePaste;
+    /**
+     * Abort any in-flight chunk reads for a batch and clear their timeouts. Without this, a read
+     * still running when the batch is torn down keeps its FileReader and a 60s reader-timeout
+     * alive. Shared by every upload teardown path (fail, supersede, dispose).
+     */
+    private abortInFlightReads;
+    /**
+     * Fail the in-flight upload (reject its completion, emit an upload error, clear
+     * uploadState) and resume monitoring. Used when the advertise is rejected or the
+     * paste is never pulled, so `uploadState` is released instead of lingering and
+     * throwing "Upload already in progress" on every later upload.
+     */
+    private failPendingUpload;
+    /**
+     * Tear down the current upload because a new paste is replacing it. Unlike
+     * {@link failPendingUpload}, this emits no error and leaves monitoring suppressed (a new upload
+     * is starting); it aborts in-flight reads, clears the state, and *resolves* the old completion
+     * (a replacement, not a failure).
+     */
+    private supersedeUpload;
+    /**
+     * Finalize a fully-accounted upload batch (every counted file either served in full
+     * or permanently failed). Stops the inactivity watchdog so it cannot linger past
+     * completion, retains the DroppedFile metadata so a re-paste from the remote can serve
+     * the data again, clears `uploadState`, and resolves the completion promise.
+     */
+    private finishUploadBatch;
     /**
      * Show a file picker dialog and return selected files.
      *
@@ -606,6 +895,12 @@ export declare class RdpFileTransferProvider {
     /* Excluded from this release type: sanitizePath */
     private handleFileContentsRequest;
     /**
+     * Mark a single upload file as fully served: record it, emit upload-complete once, and
+     * finalize the batch once every counted file is accounted for. Shared by the RANGE onload
+     * path (final chunk served) and the SIZE path for 0-byte files (which get no RANGE request).
+     */
+    private markUploadFileComplete;
+    /**
      * Lazily rebuild uploadState from retainedFiles when the remote re-pastes
      * after the original upload completed. This lets the main code path in
      * handleFileContentsRequest handle progress and completion identically.
@@ -613,6 +908,39 @@ export declare class RdpFileTransferProvider {
      */
     private rebuildUploadStateFromRetained;
     private handleFileContentsResponse;
+    /**
+     * Create a write handle for the given transfer and request the first
+     * data chunk.  Runs asynchronously because backend initialization
+     * (especially OPFS) is async.
+     *
+     * The init promise is stored on `state.writeHandleReady` so that
+     * DATA responses arriving before the handle is ready can await it.
+     */
+    private initWriteHandleAndRequestFirstChunk;
+    /**
+     * Write a data chunk to the storage backend and advance the download.
+     *
+     * If the write handle is not yet ready (DATA response arrived before
+     * backend init completed), this method awaits `state.writeHandleReady`
+     * to preserve chunk ordering -- each concurrent caller awaits the same
+     * promise in sequence.
+     */
+    private handleDataChunk;
+    /** Abort and clean up a write handle, ignoring errors. */
+    private abortWriteHandle;
+    /**
+     * Handle the remote's response to one of our outbound Format Lists, surfaced via
+     * `on_format_list_response`. Always re-emitted as a `format-list-response` event so
+     * a frontend can drive paste from it (inject on accept, retry on reject).
+     *
+     * On reject (`ok === false`) the remote silently discards the advertised clipboard
+     * (MS-RDPECLIP), so an upload still waiting to be pulled can never complete --
+     * previously this left `uploadState` set and every later upload threw "Upload
+     * already in progress". The watchdog-armed check scopes the release to an upload
+     * that was advertised but not yet pulled, so re-paste and an already-progressing
+     * transfer are left alone.
+     */
+    private handleFormatListResponse;
     private handleLock;
     private handleUnlock;
     private handleLocksExpired;
@@ -640,6 +968,20 @@ export declare interface RdpFileTransferProviderOptions {
      * Use this to resume clipboard monitoring after {@link onUploadStarted}.
      */
     onUploadFinished?: () => void;
+    /**
+     * Storage backend for downloads.
+     *
+     * Accepts either a preference string or a pre-constructed backend
+     * instance (useful for testing or custom backends):
+     *
+     * - `'auto'` (default): use OPFS when available, fall back to
+     *   in-memory Blob.  OPFS reduces peak RAM from ~2x file size to
+     *   ~chunk size.
+     * - `'blob'`: force in-memory Blob storage.
+     * - `FileStorageBackend`: use the provided backend instance directly,
+     *   bypassing auto-detection.
+     */
+    storageBackend?: StorageBackendPreference | FileStorageBackend;
 }
 
 export declare function requestFileContents(params: {
@@ -701,6 +1043,17 @@ declare class SessionTerminationInfo {
     reason(): string;
 }
 
+/**
+ * Storage backend preference for downloads.
+ *
+ * - `'auto'` - detect the best available backend (OPFS with Blob
+ *   fallback).  OPFS reduces peak download RAM from ~2x file size to
+ *   ~chunk size.
+ * - `'blob'` - force in-memory Blob storage regardless of OPFS
+ *   availability.
+ */
+export declare type StorageBackendPreference = 'auto' | 'blob';
+
 export declare function submitFileContents(params: {
     stream_id: number;
     is_error: boolean;
@@ -736,5 +1089,9 @@ export declare interface UploadHandle {
     /** Promise that resolves when all files in the batch have been uploaded */
     completion: Promise<void>;
 }
+
+export declare function vmConnect(vmId: string, mode?: VmConnectMode): Extension;
+
+export declare type VmConnectMode = 'enhanced' | 'basic';
 
 export { }
