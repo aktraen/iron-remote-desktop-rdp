@@ -87,6 +87,12 @@ declare class DeviceEvent {
 export declare function displayControl(enable: boolean): Extension;
 
 /**
+ * Session query (`invokeExtension`): `true` once the server opened the Display Control channel,
+ * meaning a resize can be applied without reconnecting.
+ */
+export declare function displayControlReady(): Extension;
+
+/**
  * Result of initiating a file download via {@link RdpFileTransferProvider.downloadFile}.
  */
 export declare interface DownloadHandle {

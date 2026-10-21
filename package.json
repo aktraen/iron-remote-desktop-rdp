@@ -5,8 +5,8 @@
   "contributors": [
     "Benoit Cortier"
   ],
-  "description": "RDP backend for iron-remote-desktop \u2014 aktraen fork: rebased on Devolutions master 2026-09 (SIMD inverse-DWT decode) + a 2-frame acknowledge window (FreeRDP/guacd parity, was 20) so the guest stops encoding frames ahead of the client + autologon + color_depth 32 + French keyboard_layout 0x040C",
-  "version": "0.7.0-aktraen.7",
+  "description": "RDP backend for iron-remote-desktop — aktraen fork: rebased on Devolutions master 2026-09 (SIMD inverse-DWT decode) + a 2-frame acknowledge window (FreeRDP/guacd parity, was 20) so the guest stops encoding frames ahead of the client + autologon + color_depth 32 + French keyboard_layout 0x040C + live resize: RFX clipped to the decoded image, canvas follows the server size after reactivation, displayControlReady query",
+  "version": "0.7.0-aktraen.8",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Devolutions/IronRDP.git"
