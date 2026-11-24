@@ -390,6 +390,20 @@ export declare interface FileWriteHandle {
     readonly bytesWritten: number;
 }
 
+/** A damaged area of `renderCanvas()`; `right` and `bottom` are exclusive. */
+export declare interface GraphicsRegion {
+    left: number;
+    top: number;
+    right: number;
+    bottom: number;
+}
+
+/**
+ * Receives the areas of `renderCanvas()` repainted by each session loop iteration (at most 64, else
+ * their bounding box), after the canvas was updated.
+ */
+export declare function graphicsRegionCallback(callback: (regions: GraphicsRegion[]) => void): Extension;
+
 export declare function init(log_level: string): Promise<void>;
 
 export declare function initiateFileCopy(files: FileInfo[]): Extension;
@@ -503,6 +517,139 @@ export declare interface PrintJobStreamCallbacks {
 }
 
 export declare function printJobStreamCallbacks(callbacks: PrintJobStreamCallbacks): Extension;
+
+/** Raises and focuses a window (or deactivates it with `enabled = false`). */
+export declare function railActivate(id: number, enabled?: boolean): Extension;
+
+/** Launches an executable; queued until RAIL is established. */
+export declare function railExecute(options: RailExecuteOptions): Extension;
+
+export declare interface RailExecuteOptions {
+    /** Executable path; xrdp ignores arguments and working directory. */
+    exe: string;
+    args?: string;
+    workDir?: string;
+}
+
+export declare interface RailRect {
+    left: number;
+    top: number;
+    width: number;
+    height: number;
+}
+
+/**
+ * Sends the work area again so the server re-sends every window it still maps; after about 5 to 10 s, windows
+ * it did not re-send (for example ones it unmapped) are deleted. A deleted window the server later updates
+ * stays unknown until it is announced as new again. Popups (menus, tooltips) open during a launch are not
+ * re-sent by xrdp, so they may be deleted; xrdp announces them again the next time they open.
+ */
+export declare function railResync(): Extension;
+
+/** `invokeExtension(railState())` result; the state fields are absent before the session runs. */
+export declare interface RailSessionState extends Partial<RailStateEvent> {
+    windows: RailWindowSnapshot[];
+}
+
+/**
+ * Sets the work area (where the server places and maximizes windows) and sends it alone, without a display
+ * change. A desktop resize resets it to the whole desktop.
+ */
+export declare function railSetWorkArea(rect: RailRect): Extension;
+
+export declare type RailShowState = 'hidden' | 'minimized' | 'maximized' | 'shown';
+
+/**
+ * `exhausted`: the server never answered the initiation, which is also what xrdp with its RAIL channel
+ * disabled produces (after 24 attempts 5 s apart by default); a late answer still establishes it.
+ * `unavailable`: the server did not join the RAIL channel (or it cannot be used); final.
+ * Neither ends the session, and `rail*` operations throw in both.
+ */
+export declare type RailState = 'initiating' | 'established' | 'resyncing' | 'exhausted' | 'unavailable';
+
+/** Returns the current `RailSessionState`. */
+export declare function railState(): Extension;
+
+/** Receives every RAIL state change, initiation attempt and protocol warning. */
+export declare function railStateCallback(callback: (event: RailStateEvent) => void): Extension;
+
+export declare interface RailStateEvent {
+    state: RailState;
+    /** Initiation attempts so far. */
+    attempt: number;
+    /** The size of the remote desktop. */
+    desktopWidth: number;
+    desktopHeight: number;
+    /** The work area sent to the server: the whole desktop unless set with `railSetWorkArea()`. */
+    workArea: RailRect;
+    /** Why RAIL is `unavailable`, or a server protocol violation that was ignored. */
+    warning?: string;
+}
+
+export declare type RailSysCommand = 'close' | 'minimize' | 'maximize' | 'restore' | 'move' | 'size' | 'keymenu' | 'default';
+
+/**
+ * Sends a system command. On xrdp, `close` asks the application to close (the window stays until its
+ * `deleted` event), `maximize` is ignored, and `minimize` unmaps the window: xrdp then forgets it at the next
+ * launch and never re-sends it, so the window is orphaned. Hosts minimize by moving the window off-screen
+ * with `railWindowMove()` instead.
+ */
+export declare function railSysCommand(id: number, command: RailSysCommand): Extension;
+
+/** Receives every window creation, change and deletion. */
+export declare function railWindowCallback(callback: (event: RailWindowEvent) => void): Extension;
+
+export declare type RailWindowChange = 'title' | 'geometry' | 'visibility' | 'showState' | 'style' | 'owner';
+
+export declare type RailWindowEvent = {
+    kind: 'created';
+    id: number;
+    window: RailWindowSnapshot;
+} | {
+    kind: 'updated';
+    id: number;
+    window: RailWindowSnapshot;
+    changed: RailWindowChange[];
+    /**
+     * The server sent the window again as new: xrdp does for every mapped window after each launch
+     * (a work area alone re-sends windows as plain updates).
+     */
+    reannounced: boolean;
+    /** The change comes from this client's own `railWindowMove()`, not from the server. */
+    local: boolean;
+} | {
+    kind: 'deleted';
+    id: number;
+};
+
+/**
+ * Moves and resizes a window (at least 1x1; every edge must fit in a signed 16-bit coordinate). The server
+ * never confirms it; the session reports it at once as an `updated` event with `local: true`. A window the
+ * session does not know is ignored.
+ */
+export declare function railWindowMove(id: number, rect: RailRect): Extension;
+
+export declare type RailWindowRole = 'app' | 'dialog' | 'popup';
+
+export declare interface RailWindowSnapshot {
+    id: number;
+    /**
+     * The owning window, or `null` for a top-level window. It may name a window that is not (or no longer)
+     * known; hosts show such a dialog as an ownerless window.
+     */
+    ownerId: number | null;
+    role: RailWindowRole;
+    showState: RailShowState;
+    title: string;
+    style: number;
+    extendedStyle: number;
+    /** Window offset and size. */
+    rect: RailRect;
+    clientRect: RailRect | null;
+    windowRects: RailRect[];
+    /** The parts of the window that are visible on the desktop. */
+    visibilityRects: RailRect[];
+}
 
 export declare class RdpFile {
     free(): void;
@@ -988,6 +1135,19 @@ export declare interface RdpFileTransferProviderOptions {
      *   bypassing auto-detection.
      */
     storageBackend?: StorageBackendPreference | FileStorageBackend;
+}
+
+/** Makes the session an xrdp RemoteApp session. */
+export declare function remoteApp(options: RemoteAppOptions): Extension;
+
+export declare interface RemoteAppOptions {
+    /** Sent in the Client Info PDU; xrdp starts the RemoteApp session from it. */
+    alternateShell: string;
+    workDir?: string;
+    /** Executed once to wake xrdp's RAIL channel, which waits for a client Execute (default `/usr/bin/true`). */
+    bootstrapExecutable?: string;
+    /** Initiation attempts, one every 5 s, before the state becomes `exhausted` (default 24). */
+    maxInitAttempts?: number;
 }
 
 export declare function requestFileContents(params: {
